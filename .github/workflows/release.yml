@@ -1,0 +1,174 @@
+name: Build and release ImgZip
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: imgzip-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-windows:
+    name: Windows 7+ (x64)
+    runs-on: windows-2022
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      # Python 3.8 is the final CPython minor series that supports Windows 7.
+      # 3.8.10 is used by this CI build; build_win.bat selects PyInstaller 4.10.
+      - name: Set up Python for Windows 7 compatibility
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.8.10'
+          architecture: x64
+
+      - name: Apply version from tag and create project environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_REF_NAME -notmatch '^v\d+\.\d+\.\d+$') {
+            throw "Invalid release tag: $env:GITHUB_REF_NAME (expected vX.Y.Z)"
+          }
+          python tools/sync_version.py $env:GITHUB_REF_NAME
+          python -m venv .venv
+          .venv\Scripts\python.exe --version
+
+      - name: Build Windows executable
+        shell: cmd
+        run: build_win.bat < NUL
+
+      - name: Upload Windows build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-build-diagnostics
+          path: |
+            build_win.log
+            build/ImgZip/warn-ImgZip.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Name Windows release file
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (!(Test-Path 'dist\ImgZip.exe')) {
+            throw 'dist\ImgZip.exe was not created.'
+          }
+          New-Item -ItemType Directory -Force release | Out-Null
+          Copy-Item 'dist\ImgZip.exe' "release\ImgZip_$($env:GITHUB_REF_NAME)_Win.exe"
+          Get-Item release\*
+
+      - name: Upload Windows release asset
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-Win
+          path: release/ImgZip_*_Win.exe
+          if-no-files-found: error
+          retention-days: 14
+
+  build-macos:
+    name: macOS 11+ (${{ matrix.display_name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            arch: x86_64
+            suffix: MacIntel
+            display_name: Intel
+          - runner: macos-15
+            arch: arm64
+            suffix: MacApple
+            display_name: Apple Silicon
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          architecture: ${{ matrix.arch == 'x86_64' && 'x64' || 'arm64' }}
+
+      - name: Apply version from tag and create project environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release tag: $GITHUB_REF_NAME (expected vX.Y.Z)" >&2
+            exit 1
+          fi
+          python tools/sync_version.py "$GITHUB_REF_NAME"
+          python -m venv .venv
+          .venv/bin/python --version
+          echo "Runner architecture: $(uname -m)"
+          echo "Python architecture: $(.venv/bin/python -c 'import platform; print(platform.machine())')"
+
+      - name: Build macOS app
+        shell: bash
+        run: bash build_mac.sh
+
+      - name: Archive macOS app bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="dist/ImgZip.app"
+          test -d "$APP"
+          mkdir -p release
+          ARCHIVE="release/ImgZip_${GITHUB_REF_NAME}_${{ matrix.suffix }}.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "$ARCHIVE"
+          ls -lh "$ARCHIVE"
+
+      - name: Upload macOS release asset
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.suffix }}
+          path: release/ImgZip_*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-release:
+    name: Publish GitHub Release
+    needs:
+      - build-windows
+      - build-macos
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all platform assets
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          find release-assets -maxdepth 1 -type f -print
+          test -n "$(find release-assets -maxdepth 1 -type f -name '*_Win.exe' -print -quit)"
+          test -n "$(find release-assets -maxdepth 1 -type f -name '*_MacIntel.zip' -print -quit)"
+          test -n "$(find release-assets -maxdepth 1 -type f -name '*_MacApple.zip' -print -quit)"
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ImgZip ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: release-assets/*
